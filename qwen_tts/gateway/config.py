@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 def _split_csv(s: str) -> List[str]:
@@ -21,6 +21,8 @@ class GatewaySettings:
     dtype: str = "bfloat16"
     flash_attn: bool = True
     cors_origins: List[str] = field(default_factory=lambda: ["*"])
+    # If set, POST /v1/admin/unload requires Authorization: Bearer <token> (or X-Admin-Token).
+    admin_token: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -40,4 +42,13 @@ class GatewaySettings:
         )
         cors = os.environ.get("QWEN_TTS_CORS_ORIGINS", "*").strip()
         origins = ["*"] if cors == "*" else _split_csv(cors)
-        return cls(model_path=path, device=device, dtype=dtype, flash_attn=flash, cors_origins=origins)
+        admin = os.environ.get("QWEN_TTS_ADMIN_TOKEN", "").strip()
+        admin_token = admin if admin else None
+        return cls(
+            model_path=path,
+            device=device,
+            dtype=dtype,
+            flash_attn=flash,
+            cors_origins=origins,
+            admin_token=admin_token,
+        )

@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import json
 import os
-from contextlib import asynccontextmanager
-from typing import Any, Dict, Generator, Optional
+import threading
+import time
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, Callable, Dict, Generator, Optional
 
 import numpy as np
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -48,6 +51,45 @@ def _load_model(settings: GatewaySettings) -> Qwen3TTSModel:
         dtype=dtype,
         attn_implementation=attn,
     )
+
+
+def _unload_tts_model(tts: Qwen3TTSModel) -> None:
+    """Drop references and release GPU memory (best-effort)."""
+    try:
+        del tts.model
+    except Exception:
+        pass
+    try:
+        del tts.processor
+    except Exception:
+        pass
+    try:
+        del tts
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+def _assert_admin_token(
+    settings: GatewaySettings,
+    authorization: Optional[str],
+    x_admin_token: Optional[str],
+) -> None:
+    if not settings.admin_token:
+        raise HTTPException(
+            status_code=501,
+            detail="Admin API disabled. Set QWEN_TTS_ADMIN_TOKEN to enable /v1/admin/unload.",
+        )
+    token: Optional[str] = None
+    if x_admin_token:
+        token = x_admin_token.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if not token or token != settings.admin_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing admin token.")
 
 
 def _merge_gen_kwargs(extra: Dict[str, Any]) -> Dict[str, Any]:
@@ -131,9 +173,17 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.model_loaded = True
+        app.state._active_inferences = 0
+        app.state._inference_cond = threading.Condition()
+        app.state.cancel_generation = threading.Event()
         app.state.tts = _load_model(settings)
         app.state.settings = settings
         yield
+        if getattr(app.state, "tts", None) is not None:
+            _unload_tts_model(app.state.tts)
+            app.state.tts = None
+        app.state.model_loaded = False
 
     app = FastAPI(
         title="Qwen3 TTS Gateway",
@@ -151,16 +201,39 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    def tts() -> Qwen3TTSModel:
-        return app.state.tts
+    def _tts() -> Qwen3TTSModel:
+        if not getattr(app.state, "model_loaded", True):
+            raise HTTPException(status_code=503, detail="Model unloaded; restart the gateway process to load again.")
+        t = getattr(app.state, "tts", None)
+        if t is None:
+            raise HTTPException(status_code=503, detail="Model unloaded; restart the gateway process to load again.")
+        return t
+
+    @contextmanager
+    def _inference_scope():
+        if not getattr(app.state, "model_loaded", True) or app.state.tts is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Model unloaded; restart the gateway process to load again.",
+            )
+        app.state._active_inferences += 1
+        try:
+            yield
+        finally:
+            app.state._active_inferences -= 1
+            with app.state._inference_cond:
+                app.state._inference_cond.notify_all()
 
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "model_loaded": bool(getattr(app.state, "model_loaded", True) and getattr(app.state, "tts", None)),
+        }
 
     @app.get("/v1/meta")
     def meta():
-        m = tts().model
+        m = _tts().model
         out = {
             "model_path": settings.model_path,
             "device": settings.device,
@@ -182,44 +255,46 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
 
     @app.post("/v1/tts/custom_voice")
     def custom_voice(body: CustomVoiceBody):
-        if tts().model.tts_model_type != "custom_voice":
-            raise HTTPException(
-                status_code=400,
-                detail="Current model is not CustomVoice; load Qwen3-TTS-*-CustomVoice.",
-            )
-        g = body.gen.model_dump(exclude_none=True)
-        kwargs = _merge_gen_kwargs(g)
-        try:
-            wavs, sr = tts().generate_custom_voice(
-                text=body.text.strip(),
-                speaker=body.speaker,
-                language=body.language,
-                instruct=(body.instruct or "").strip() or None,
-                **kwargs,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return Response(content=wav_bytes_from_array(wavs[0], sr), media_type="audio/wav")
+        with _inference_scope():
+            if _tts().model.tts_model_type != "custom_voice":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Current model is not CustomVoice; load Qwen3-TTS-*-CustomVoice.",
+                )
+            g = body.gen.model_dump(exclude_none=True)
+            kwargs = _merge_gen_kwargs(g)
+            try:
+                wavs, sr = _tts().generate_custom_voice(
+                    text=body.text.strip(),
+                    speaker=body.speaker,
+                    language=body.language,
+                    instruct=(body.instruct or "").strip() or None,
+                    **kwargs,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            return Response(content=wav_bytes_from_array(wavs[0], sr), media_type="audio/wav")
 
     @app.post("/v1/tts/voice_design")
     def voice_design(body: VoiceDesignBody):
-        if tts().model.tts_model_type != "voice_design":
-            raise HTTPException(
-                status_code=400,
-                detail="Current model is not VoiceDesign; load Qwen3-TTS-*-VoiceDesign.",
-            )
-        g = body.gen.model_dump(exclude_none=True)
-        kwargs = _merge_gen_kwargs(g)
-        try:
-            wavs, sr = tts().generate_voice_design(
-                text=body.text.strip(),
-                instruct=body.instruct.strip(),
-                language=body.language,
-                **kwargs,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return Response(content=wav_bytes_from_array(wavs[0], sr), media_type="audio/wav")
+        with _inference_scope():
+            if _tts().model.tts_model_type != "voice_design":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Current model is not VoiceDesign; load Qwen3-TTS-*-VoiceDesign.",
+                )
+            g = body.gen.model_dump(exclude_none=True)
+            kwargs = _merge_gen_kwargs(g)
+            try:
+                wavs, sr = _tts().generate_voice_design(
+                    text=body.text.strip(),
+                    instruct=body.instruct.strip(),
+                    language=body.language,
+                    **kwargs,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            return Response(content=wav_bytes_from_array(wavs[0], sr), media_type="audio/wav")
 
     @app.post("/v1/tts/voice_clone")
     async def voice_clone(
@@ -229,60 +304,62 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
         x_vector_only: bool = Form(False),
         ref_audio: UploadFile = File(...),
     ):
-        if tts().model.tts_model_type != "base":
-            raise HTTPException(
-                status_code=400,
-                detail="Current model is not Base; load Qwen3-TTS-*-Base for voice clone.",
-            )
         raw = await ref_audio.read()
         try:
             wav, sr = read_wav_from_upload(raw)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid audio file: {e}") from e
-        kwargs = _merge_gen_kwargs({})
-        model = tts()
+        with _inference_scope():
+            if _tts().model.tts_model_type != "base":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Current model is not Base; load Qwen3-TTS-*-Base for voice clone.",
+                )
+            kwargs = _merge_gen_kwargs({})
+            model = _tts()
 
-        def _run():
-            return model.generate_voice_clone(
-                text=text.strip(),
-                language=language,
-                ref_audio=(wav, sr),
-                ref_text=(ref_text.strip() if ref_text else None),
-                x_vector_only_mode=x_vector_only,
-                **kwargs,
-            )
+            def _run():
+                return model.generate_voice_clone(
+                    text=text.strip(),
+                    language=language,
+                    ref_audio=(wav, sr),
+                    ref_text=(ref_text.strip() if ref_text else None),
+                    x_vector_only_mode=x_vector_only,
+                    **kwargs,
+                )
 
-        try:
-            wavs, out_sr = await asyncio.to_thread(_run)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return Response(content=wav_bytes_from_array(wavs[0], out_sr), media_type="audio/wav")
+            try:
+                wavs, out_sr = await asyncio.to_thread(_run)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            return Response(content=wav_bytes_from_array(wavs[0], out_sr), media_type="audio/wav")
 
     @app.post("/v1/tts/voice_clone/json")
     def voice_clone_json(body: VoiceCloneJsonBody):
-        if tts().model.tts_model_type != "base":
-            raise HTTPException(
-                status_code=400,
-                detail="Current model is not Base; load Qwen3-TTS-*-Base for voice clone.",
-            )
         try:
             wav, sr = read_wav_from_base64(body.ref_audio_base64)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid ref_audio_base64: {e}") from e
-        g = body.gen.model_dump(exclude_none=True)
-        kwargs = _merge_gen_kwargs(g)
-        try:
-            wavs, out_sr = tts().generate_voice_clone(
-                text=body.text.strip(),
-                language=body.language,
-                ref_audio=(wav, sr),
-                ref_text=(body.ref_text.strip() if body.ref_text else None),
-                x_vector_only_mode=body.x_vector_only,
-                **kwargs,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return Response(content=wav_bytes_from_array(wavs[0], out_sr), media_type="audio/wav")
+        with _inference_scope():
+            if _tts().model.tts_model_type != "base":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Current model is not Base; load Qwen3-TTS-*-Base for voice clone.",
+                )
+            g = body.gen.model_dump(exclude_none=True)
+            kwargs = _merge_gen_kwargs(g)
+            try:
+                wavs, out_sr = _tts().generate_voice_clone(
+                    text=body.text.strip(),
+                    language=body.language,
+                    ref_audio=(wav, sr),
+                    ref_text=(body.ref_text.strip() if body.ref_text else None),
+                    x_vector_only_mode=body.x_vector_only,
+                    **kwargs,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            return Response(content=wav_bytes_from_array(wavs[0], out_sr), media_type="audio/wav")
 
     @app.post("/v1/tts/voice_clone/prompt")
     async def voice_clone_prompt(
@@ -290,11 +367,6 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
         language: str = Form("Auto"),
         voice_prompt: UploadFile = File(..., description="voice_clone_prompt_*.pt from Gradio demo"),
     ):
-        if tts().model.tts_model_type != "base":
-            raise HTTPException(
-                status_code=400,
-                detail="Current model is not Base; load Qwen3-TTS-*-Base.",
-            )
         fd, path = None, None
         try:
             import tempfile
@@ -318,24 +390,33 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
                 except OSError:
                     pass
 
-        kwargs = _merge_gen_kwargs({})
-        model = tts()
+        with _inference_scope():
+            if _tts().model.tts_model_type != "base":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Current model is not Base; load Qwen3-TTS-*-Base.",
+                )
+            kwargs = _merge_gen_kwargs({})
+            model = _tts()
 
-        def _run_prompt():
-            return model.generate_voice_clone(
-                text=text.strip(),
-                language=language,
-                voice_clone_prompt=items,
-                **kwargs,
-            )
+            def _run_prompt():
+                return model.generate_voice_clone(
+                    text=text.strip(),
+                    language=language,
+                    voice_clone_prompt=items,
+                    **kwargs,
+                )
 
-        try:
-            wavs, out_sr = await asyncio.to_thread(_run_prompt)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return Response(content=wav_bytes_from_array(wavs[0], out_sr), media_type="audio/wav")
+            try:
+                wavs, out_sr = await asyncio.to_thread(_run_prompt)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            return Response(content=wav_bytes_from_array(wavs[0], out_sr), media_type="audio/wav")
 
-    def _sse_voice_clone_stream(body: VoiceCloneStreamBody) -> Generator[bytes, None, None]:
+    def _sse_voice_clone_stream(
+        body: VoiceCloneStreamBody,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Generator[bytes, None, None]:
         g = body.gen.model_dump(exclude_none=True)
         kwargs = _merge_gen_kwargs(g)
         try:
@@ -343,7 +424,7 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
         except Exception as e:
             raise ValueError(f"Invalid ref_audio_base64: {e}") from e
 
-        for chunk, chunk_sr in tts().stream_generate_voice_clone(
+        for chunk, chunk_sr in _tts().stream_generate_voice_clone(
             text=body.text.strip(),
             language=body.language,
             ref_audio=(wav, sr),
@@ -352,6 +433,7 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
             emit_every_frames=body.emit_every_frames,
             decode_window_frames=body.decode_window_frames,
             overlap_samples=body.overlap_samples,
+            cancel_check=cancel_check,
             **kwargs,
         ):
             payload = {
@@ -362,24 +444,52 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
         yield b"event: done\ndata: {}\n\n"
 
     @app.post("/v1/tts/voice_clone/stream")
-    def voice_clone_stream_sse(body: VoiceCloneStreamBody):
-        if tts().model.tts_model_type != "base":
+    async def voice_clone_stream_sse(request: Request, body: VoiceCloneStreamBody):
+        if _tts().model.tts_model_type != "base":
             raise HTTPException(
                 status_code=400,
                 detail="Current model is not Base; load Qwen3-TTS-*-Base.",
             )
-        if not hasattr(tts(), "stream_generate_voice_clone"):
+        if not hasattr(_tts(), "stream_generate_voice_clone"):
             raise HTTPException(
                 status_code=501,
                 detail="Streaming is not available in this install (needs streaming-capable fork).",
             )
         try:
-            gen = _sse_voice_clone_stream(body)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+            read_wav_from_base64(body.ref_audio_base64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid ref_audio_base64: {e}") from e
+
+        disconnected = threading.Event()
+
+        def cancel_check() -> bool:
+            if disconnected.is_set():
+                return True
+            cg = getattr(app.state, "cancel_generation", None)
+            return bool(cg is not None and cg.is_set())
+
+        async def watch_disconnect() -> None:
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        disconnected.set()
+                        return
+                    await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                disconnected.set()
+                raise
+
+        watch_task = asyncio.create_task(watch_disconnect())
+
+        def stream_gen() -> Generator[bytes, None, None]:
+            try:
+                with _inference_scope():
+                    yield from _sse_voice_clone_stream(body, cancel_check=cancel_check)
+            finally:
+                watch_task.cancel()
 
         return StreamingResponse(
-            gen,
+            stream_gen(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -387,6 +497,31 @@ def create_app(settings: Optional[GatewaySettings] = None) -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @app.post("/v1/admin/unload")
+    async def admin_unload(
+        authorization: Optional[str] = Header(None),
+        x_admin_token: Optional[str] = Header(None),
+    ):
+        _assert_admin_token(settings, authorization, x_admin_token)
+        app.state.cancel_generation.set()
+        deadline = time.monotonic() + 120.0
+        with app.state._inference_cond:
+            while app.state._active_inferences > 0:
+                if time.monotonic() >= deadline:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Timeout waiting for in-flight inference to stop; try again.",
+                    )
+                remaining = max(0.0, deadline - time.monotonic())
+                app.state._inference_cond.wait(timeout=min(1.0, remaining))
+        tts = getattr(app.state, "tts", None)
+        if tts is not None:
+            _unload_tts_model(tts)
+        app.state.tts = None
+        app.state.model_loaded = False
+        app.state.cancel_generation.clear()
+        return {"ok": True, "detail": "Model unloaded and GPU cache cleared. Restart the process to load again."}
 
     return app
 
