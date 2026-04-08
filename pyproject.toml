@@ -37,6 +37,7 @@ Repository = "https://github.com/Qwen/Qwen3-TTS"
 
 [project.scripts]
 qwen-tts-demo = "qwen_tts.cli.demo:main"
+qwen-tts-gateway = "qwen_tts.gateway.__main__:main"
 
 [tool.setuptools]
 packages = { find = { where = ["."] , include = ["qwen_tts*"] } }
