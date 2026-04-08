@@ -1,8 +1,11 @@
+# Byte-compiled / cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Distribution / packaging
 build/
 develop-eggs/
 dist/
@@ -18,7 +21,55 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-.idea/
-.vscode/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Virtual environments
+.venv/
 venv/
 env/
+ENV/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Hugging Face / PyTorch 缓存（本机下载的模型与权重，勿提交）
+.cache/
+huggingface/
+hub/
+**/hf_cache/
+
+# 日志与临时文件
+*.log
+*.tmp
+*.temp
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 可选：本地合成输出（若需提交示例音频，请从下列规则中移除对应行）
+# *.wav
+# output*.wav
+
+# ---------------------------------------------------------------------------
+# 自引用：将「本忽略文件」自身列入忽略模式，避免误用 git add . 时纳入索引。
+# 若你希望把 .gitignore 规则提交到远程仓库，请显式执行：
+#   git add -f .gitignore
+# ---------------------------------------------------------------------------
+.gitignore
