@@ -2637,6 +2637,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         max_frames: int = 10000,
         # Optimization flags
         use_optimized_decode: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2659,6 +2660,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             overlap_samples: Overlap samples for crossfade between chunks
             max_frames: Maximum number of codec frames to generate
             use_optimized_decode: Use CUDA graph optimized decode when available (default True)
+            cancel_check: If set, called at the start of each decode step; return True to stop early
+                (e.g. HTTP client disconnect or admin unload).
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2737,7 +2740,11 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         frames_since_emit = 0
         total_frames_emitted = 0  # Track how many frames we've already emitted audio for
 
+        cancelled = False
         for step_idx in range(max_frames):
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                break
             # Mark step begin for CUDA graphs to avoid tensor overwrite errors
             # This is required when using torch.compile with reduce-overhead mode
             torch.compiler.cudagraph_mark_step_begin()
@@ -2829,7 +2836,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         # Flush: decode only remaining frames that haven't been emitted yet
         remaining_frames = len(codes_buffer) - total_frames_emitted
-        if remaining_frames > 0:
+        if not cancelled and remaining_frames > 0:
             # Decode a window that includes some context for quality
             context_frames = min(total_frames_emitted, decode_window_frames - remaining_frames)
             start_idx = total_frames_emitted - context_frames
